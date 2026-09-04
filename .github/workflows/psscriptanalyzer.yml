@@ -4,10 +4,12 @@ on:
   push:
     paths:
       - '**.ps1'
+      - 'PSScriptAnalyzerSettings.psd1'
       - '.github/workflows/psscriptanalyzer.yml'
   pull_request:
     paths:
       - '**.ps1'
+      - 'PSScriptAnalyzerSettings.psd1'
       - '.github/workflows/psscriptanalyzer.yml'
   workflow_dispatch:
 
