@@ -138,6 +138,143 @@ are new in 1.1.0 and split cases that used to be reported as `1002` or `1004`.
 | `1007` | Definitions stale **and** real-time protection off. | Defender degraded on both axes; often a half-removed third-party AV. | Treat as the highest priority of the failure codes. Check RTP first, definitions second. | No |
 | `1008` | Update method reported success but the signature version never moved. | WSUS approving nothing, an internal definition share serving stale content, or a source that returns success with no payload. | Check what the configured source is actually offering — this is a source problem, not an endpoint problem. | No |
 
+## Function reference
+
+**On "public".** The script is a standalone `.ps1` — no manifest, no
+`Export-ModuleMember`, and dot-sourcing it executes the remediation rather than
+importing anything. Nothing below has an exported surface; every function is
+script-scope and reachable only from within a run. They are documented here
+because they are the units the [control flow](#control-flow) is assembled from,
+and the places an exit code is actually decided. The README's *Internal
+functions* section covers the same six from the editing perspective — parameter
+defaults, binding details — and is the place to look before changing a
+signature.
+
+One convention explains most of those signatures. `Write-Log` writes to the
+success stream, which is also a function's return path, so a helper that both
+logs and produces a result would have its log lines swallowed by the caller's
+assignment. Those helpers return nothing and hand the result back through a
+`[ref]` parameter instead, which is why the log arrives on stdout as the run
+progresses rather than in a batch at the end.
+
+| Function | Signature | Phase | Result path |
+|----------|-----------|-------|-------------|
+| `Write-Log` | `-Message <string>` (mandatory; `AllowNull`, `AllowEmptyString`) | All | Writes one `[yyyy-MM-dd HH:mm:ss] <message>` line to stdout. Returns nothing. |
+| `Test-IsElevated` | none | Pre-flight | Returns `[bool]`. |
+| `Get-MpCmdRunPath` | none | Update (method 3) | Returns a path `[string]`, or `$null`. |
+| `Invoke-JobWithTimeout` | `-Description <string>`, `-ScriptBlock <scriptblock>`, `-TimeoutSeconds <int>`, `-ResultRef <ref>` (all mandatory), `-ArgumentList <object[]>` (default `@()`) | Update (all three methods) | `-ResultRef`; `$null` means no usable answer. |
+| `Wait-ForServiceRunning` | `-Name <string>`, `-TimeoutSeconds <int>`, `-IsRunningRef <ref>` (all mandatory), `-IntervalSeconds <int>` (default `2`) | Pre-flight (service start) | `-IsRunningRef` `[bool]`. |
+| `Wait-ForSignatureRefresh` | `-MaxAgeDays <int>`, `-TimeoutSeconds <int>`, `-StatusRef <ref>` (all mandatory), `-IntervalSeconds <int>` (default `5`) | Verify | `-StatusRef`; the last status object read, or `$null`. |
+
+### `Write-Log`
+
+The script's only output path — there is no verbose or warning stream to
+enable, for the reason given under [Execution model](#execution-model). It
+coerces `$null` to an empty string before formatting: `MpCmdRun.exe` emits
+blank lines, a mandatory `[string]` implicitly rejects `''`, and the binding
+exception would surface through the outer catch as `1005` — the fallback update
+path dying through its own logging. The full date is included because RMM logs
+are read days later, often from another time zone.
+
+### `Test-IsElevated`
+
+Runs before anything else touches Defender. SYSTEM's token is a member of
+`BUILTIN\Administrators`, so this is true under the agent as well as in an
+elevated console. **Decides `1001`** on the non-elevated path. Checking it
+first is the whole point: without elevation both `Update-MpSignature` attempts
+fail on access denied, and the run would otherwise report `1003` and send the
+technician to inspect a proxy and a WSUS that are both fine.
+
+### `Get-MpCmdRunPath`
+
+Locates the executable for the third update method. Prefers the active platform
+under `%ProgramData%\Microsoft\Windows Defender\Platform`, whose folders are
+named after their version, selecting the highest name parsed as a `[version]` —
+a trailing `-<digits>` suffix is stripped, and an unparseable name sorts as
+`0.0`. Sorting on the parsed version rather than `LastWriteTime` matters
+because that directory accumulates old platform versions and the timestamp gets
+touched by unrelated activity. Falls back to
+`%ProgramFiles%\Windows Defender\MpCmdRun.exe`, then `$null`. A `$null` return
+skips the fallback method entirely, which on a run where methods 1 and 2 have
+already failed **means `1003`**.
+
+### `Invoke-JobWithTimeout`
+
+The containment boundary for every update attempt, and the reason the script
+cannot outlive the agent's task timeout. Runs the scriptblock in a background
+job under a hard ceiling and writes the job's last non-null output to
+`-ResultRef`. `$null` covers three cases the callers treat alike: the job could
+not be started, it did not finish within `-TimeoutSeconds`, or it returned
+nothing. A failure to *start* is logged distinctly, because it is a job
+infrastructure problem on the endpoint — constrained language mode, a broken
+component — rather than the definition delivery failure that `1003` otherwise
+implies; see [Known limitations](#known-limitations). The job is stopped and
+removed in a `finally` on every path out, so nothing accumulates across the
+three attempts. Stopping a timed-out job terminates the child process; any
+download Defender started on its own carries on, which is Defender's business
+and not this script's.
+
+Worst case is three calls at `-UpdateTimeoutSeconds` each — six minutes at the
+default — before the run reports `1003`.
+
+### `Wait-ForServiceRunning`
+
+Polls a service until it reports `Running` or the ceiling expires, replacing a
+fixed sleep that was either wasted agent time or too short. Sets
+`-IsRunningRef` to `$true` on the first `Running` reading and returns
+immediately; otherwise leaves it `$false`. A missing service is logged per poll
+rather than treated as a distinct outcome. Each sleep is clamped to the time
+remaining, so the ceiling is a real bound rather than the ceiling plus one
+interval.
+
+Called once, for `WinDefend`, with the script constant
+`$ServiceStartTimeoutSeconds` (30) — deliberately not a parameter, because a
+service that has not started in 30 seconds is not going to. Its result is
+logged but does not by itself decide the exit code: the script re-reads
+`Get-MpComputerStatus` afterwards and it is Defender's own view of the AM
+service that **decides `1001`**, so the log distinguishes "the service never
+started" from "the service started and Defender still reports its AM service as
+disabled".
+
+### `Wait-ForSignatureRefresh`
+
+The entire Verify phase. Polls `Get-MpComputerStatus` until the signature age
+is at or under `-MaxAgeDays` or the ceiling expires, and writes the last status
+object it managed to read to `-StatusRef` (`$null` if it never read one).
+Keeping the last *successful* reading means a single failed poll at the end of
+the window does not discard an earlier answer. A status object that reports no
+age is logged and does not end the loop. Sleeps are clamped as above, so
+`-WaitSeconds` is a ceiling rather than a lower bound and a device that updates
+in two seconds does not hold the agent's task open for twenty. Called with the
+script constant `$PollIntervalSeconds` (5).
+
+Every terminal code from the Verify phase is decided on what this writes to
+`-StatusRef`: a `$null` object or a `$null` age **is `1006`**, and the age,
+real-time protection state and signature-version movement then select between
+`0`, `1002`, `1004`, `1007` and `1008`.
+
+### The two update scriptblocks
+
+`$UpdateSignatureScript` and `$MpCmdRunScript` are script-scope variables
+rather than functions, because each runs in its own runspace and so cannot see
+anything defined above it. Both catch their own failures and return a
+structured object rather than letting `Receive-Job` decide how an error should
+surface.
+
+| Scriptblock | Argument | Returns |
+|-------------|----------|---------|
+| `$UpdateSignatureScript` | `$UpdateSource` — `MicrosoftUpdateServer` or `MMPC` | `[pscustomobject]` with `Succeeded` `[bool]` and `Message`. |
+| `$MpCmdRunScript` | `$ExePath` — from `Get-MpCmdRunPath` | `[pscustomobject]` with `Lines` (stdout and stderr, as strings) and `ExitCode` (`$null` if the process never ran). |
+
+`$MpCmdRunScript` relaxes `$ErrorActionPreference` to `Continue` for itself
+only: at `Stop`, redirected stderr from a native command becomes a terminating
+`NativeCommandError` in Windows PowerShell 5.1, which would report `1005` where
+`1003` is the truth. It also removes any inherited `$LASTEXITCODE` before
+launching, rather than assigning `0` — which would create a script-scope shadow
+the engine never updates — so a stale value from an earlier command cannot make
+a failed launch look like a successful update. A `$null` `ExitCode` is
+therefore a real signal, and the caller treats it as a failed attempt.
+
 ## Failure modes and design rationale
 
 **No network.** Both `Update-MpSignature` attempts fail fast, `MpCmdRun.exe`
