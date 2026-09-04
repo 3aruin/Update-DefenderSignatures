@@ -29,9 +29,12 @@ about each exit code — see [ARCHITECTURE.md](ARCHITECTURE.md).
    the device, that's a healthy machine and the script stops there rather than
    reporting a problem. Older Defender platforms don't expose this property;
    the script logs that it couldn't tell and continues.
-4. Starts the `WinDefend` service if it isn't running, polling for it to come
-   up, and re-checks before continuing — no point trying to force an update
-   against a service that never started.
+4. If Defender reports its AM service as disabled, starts `WinDefend` and polls
+   it for `Running` for up to 30 seconds, then re-reads Defender status before
+   continuing — no point trying to force an update against a service that never
+   started. Defender's own view of the AM service is what decides, so the log
+   distinguishes "the service never started" from "the service started but
+   Defender still reports its AM service as disabled".
 5. Optionally (`-Harden`) tightens the device's own update schedule, then reads
    the values back so you can see whether policy overrode them.
 6. Tries, in order, each inside a background job with a timeout:
@@ -67,6 +70,12 @@ is configured tighter.
 | `-UpdateTimeoutSeconds` | int | `120` | Per-attempt ceiling for each update method. Bounds the run so a hung update can't be killed mid-flight by the agent's own timeout. |
 | `-Harden` | switch | off | Also sets `SignatureUpdateInterval` (8h) and `SignatureUpdateCatchupInterval` (1d), then logs the effective values. Where GPO or Intune manages these, the write still succeeds but policy wins when Defender reads it — the log shows the difference. |
 
+The integer parameters are range-validated, and a value outside its range fails
+at parameter binding before the script logs anything: `-MaxAgeDays` accepts
+`0`–`30`, `-WaitSeconds` accepts `0`–`300`, and `-UpdateTimeoutSeconds` accepts
+`30`–`600`. Note that the floor on `-UpdateTimeoutSeconds` is 30, not 0 — a
+ceiling tighter than that abandons methods that would have succeeded.
+
 ## Exit codes
 
 N-sight marks the task failed on any non-zero exit code. Codes `0` and
@@ -84,6 +93,88 @@ split cases that were previously reported as `1002` or `1004`.
 | `1006` | Defender status couldn't be re-read after an update that reported success. Investigate Defender/WMI health, not definition delivery. |
 | `1007` | Definitions are stale **and** real-time protection is off. Highest priority of the failure codes. |
 | `1008` | An update method reported success but the signature version never moved — the update source isn't offering current definitions. |
+
+## Internal functions
+
+The script is a standalone `.ps1`, not a module: there is no manifest and no
+`Export-ModuleMember`, and dot-sourcing the file executes the whole remediation
+rather than importing anything. Nothing below is callable from outside a run.
+It is documented for people modifying the script.
+
+One convention explains most of the signatures. `Write-Log` writes to the
+success stream, which is also a function's return path, so a helper that both
+logs and produces a result would have its log lines swallowed by the caller's
+assignment. Those helpers return nothing and hand the result back through a
+`[ref]` parameter instead, which is why their log output reaches stdout as it
+happens.
+
+| Function | Parameters | Returns |
+|----------|-----------|---------|
+| `Write-Log` | `-Message` (string, mandatory, accepts null/empty) | Nothing. Writes `[yyyy-MM-dd HH:mm:ss] <message>` to stdout. |
+| `Test-IsElevated` | none | `[bool]` — whether the current identity is in the built-in Administrator role. |
+| `Get-MpCmdRunPath` | none | Path to `MpCmdRun.exe`, or `$null` if not found. |
+| `Invoke-JobWithTimeout` | `-Description`, `-ScriptBlock`, `-TimeoutSeconds`, `-ResultRef` (all mandatory), `-ArgumentList` (default `@()`) | Nothing. Result via `-ResultRef`. |
+| `Wait-ForServiceRunning` | `-Name`, `-TimeoutSeconds`, `-IsRunningRef` (all mandatory), `-IntervalSeconds` (default `2`) | Nothing. Result via `-IsRunningRef`. |
+| `Wait-ForSignatureRefresh` | `-MaxAgeDays`, `-TimeoutSeconds`, `-StatusRef` (all mandatory), `-IntervalSeconds` (default `5`) | Nothing. Result via `-StatusRef`. |
+
+**`Write-Log`** — the only output path in the script. Coerces `$null` to an
+empty string before formatting, because `MpCmdRun.exe` emits blank lines and a
+mandatory `[string]` implicitly rejects `''`; the binding exception would
+otherwise surface through the outer catch as `1005`, the fallback update path
+dying through its own logging. The date is included because RMM logs get read
+days later, often from another time zone.
+
+**`Test-IsElevated`** — returns true under the Advanced Monitoring Agent as
+well as an elevated console, since SYSTEM's token is a member of
+`BUILTIN\Administrators`. Called first in the run: without elevation both
+`Update-MpSignature` attempts fail on access denied and the script would
+report `1003`, pointing the technician at a proxy and a WSUS that are fine.
+
+**`Get-MpCmdRunPath`** — locates the executable for the third update method.
+Prefers the active platform under
+`%ProgramData%\Microsoft\Windows Defender\Platform`, whose folders are named
+after their version, selecting the highest folder name parsed as a `[version]`
+(a trailing `-<digits>` suffix is stripped, and an unparseable name sorts as
+`0.0`). Sorting on the parsed version rather than `LastWriteTime` matters
+because the timestamp can be touched by things other than a platform update.
+Falls back to `%ProgramFiles%\Windows Defender\MpCmdRun.exe`, then `$null`.
+
+**`Invoke-JobWithTimeout`** — runs a scriptblock in a background job under a
+hard ceiling, writing whatever the job produced (its last non-null output) to
+`-ResultRef`. `$null` means "no usable answer" and covers three cases the
+callers treat alike: the job could not be started, it did not finish within
+`-TimeoutSeconds`, or it returned nothing. A failure to start is logged
+distinctly, because it is a job infrastructure problem on the endpoint —
+constrained language mode, a broken component — rather than the definition
+delivery failure that `1003` otherwise implies. The job is stopped and removed
+in a `finally`, so nothing accumulates across the three attempts. Stopping a
+timed-out job terminates the child process; any download Defender started on
+its own continues.
+
+**`Wait-ForServiceRunning`** — polls a service until it reports `Running` or
+the ceiling expires, replacing a fixed sleep that was either wasted agent time
+or too short. Sets `-IsRunningRef` to `$true` on the first `Running` reading
+and returns immediately; otherwise leaves it `$false`. A missing service is
+logged per poll rather than treated as a distinct outcome. Each sleep is
+clamped to the time remaining, so the ceiling is a real bound rather than the
+ceiling plus one interval. Called only for `WinDefend`, with the script
+constant `$ServiceStartTimeoutSeconds` (30) — not a parameter, because a
+service that has not started in 30 seconds is not going to.
+
+**`Wait-ForSignatureRefresh`** — polls `Get-MpComputerStatus` until the
+signature age is at or under `-MaxAgeDays` or the ceiling expires, and writes
+the last status object it managed to read to `-StatusRef` (`$null` if it never
+read one). Keeping the last *successful* reading means a single failed poll at
+the end of the window does not discard an earlier answer. A status object that
+reports no age is logged and does not end the loop. Sleeps are clamped as
+above, so `-WaitSeconds` is a ceiling rather than a lower bound and a device
+that updates in two seconds does not hold the agent's task open for twenty.
+
+The two update methods themselves are scriptblocks rather than functions —
+`$UpdateSignatureScript` and `$MpCmdRunScript` — because each runs in its own
+runspace and so cannot see anything defined above it. Both catch their own
+failures and return a structured object rather than letting `Receive-Job`
+decide how an error should surface.
 
 ## Local testing
 
