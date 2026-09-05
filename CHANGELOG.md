@@ -3,6 +3,37 @@
 All notable changes to this project are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.0] - 2026-09-04
+
+Passive-mode Defender no longer fails the task.
+
+### Changed
+- **Passive-mode Defender exits `0` instead of `1001`.** 1.1.0 detected the
+  case correctly and then still returned a failure code for it, so every
+  device owned by a third-party AV produced a failed Automated Task with an
+  accurate log line inside it — the ticket storm the detection was added to
+  prevent, better documented. There is nothing to remediate on such a device:
+  Defender's definitions are expected to be stale and its real-time
+  protection is expected to be off, no rerun changes that, and no engineer
+  working the alert can clear it. The run now ends `0` and says in the log
+  that the device is healthy, that Defender is not the active AV, and that
+  the Antivirus Update Check should be excluded from it or pointed at the
+  product that actually owns the device.
+- Exit code `0` therefore covers two outcomes: definitions current with
+  real-time protection on, and Defender passive behind another AV. The
+  `Running mode` log line distinguishes them. `1001` no longer covers
+  "not the active AV"; it is now Defender absent, the service not startable,
+  or the script not elevated.
+- `$ExitCodes` gained a `NotActiveAntivirus` key, valued `0`, so the exit
+  site still reads as its own outcome and the decision is visible in the code
+  table rather than buried in a branch.
+
+### Unchanged
+- Detection itself: `AMRunningMode` is still read via `PSObject.Properties`,
+  still checked before anything else touches Defender, and an absent property
+  is still treated as inconclusive rather than as passive.
+- Every other exit code's number and meaning.
+
 ## [1.1.0] - 2026-09-01
 
 Hardening pass following an audit of the 1.0.0 release. Several of the fixes

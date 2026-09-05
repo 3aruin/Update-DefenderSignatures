@@ -26,9 +26,10 @@ about each exit code — see [ARCHITECTURE.md](ARCHITECTURE.md).
    at the wrong thing entirely.
 2. Reads current Defender status (`Get-MpComputerStatus`).
 3. Checks `AMRunningMode`. If Defender is passive because a third-party AV owns
-   the device, that's a healthy machine and the script stops there rather than
-   reporting a problem. Older Defender platforms don't expose this property;
-   the script logs that it couldn't tell and continues.
+   the device, that's a healthy machine: the script stops there and exits `0`,
+   so the task doesn't fail, and logs why plus what to fix in the monitoring
+   configuration. Older Defender platforms don't expose this property; the
+   script logs that it couldn't tell and continues.
 4. If Defender reports its AM service as disabled, starts `WinDefend` and polls
    it for `Running` for up to 30 seconds, then re-reads Defender status before
    continuing — no point trying to force an update against a service that never
@@ -78,14 +79,15 @@ ceiling tighter than that abandons methods that would have succeeded.
 
 ## Exit codes
 
-N-sight marks the task failed on any non-zero exit code. Codes `0` and
-`1001`–`1005` mean what they meant in 1.0.0; `1006`–`1008` are new in 1.1.0 and
-split cases that were previously reported as `1002` or `1004`.
+N-sight marks the task failed on any non-zero exit code. Codes `1001`–`1005`
+mean what they meant in 1.0.0; `1006`–`1008` were added in 1.1.0 and split
+cases that were previously reported as `1002` or `1004`. In 1.2.0 passive-mode
+Defender moved from `1001` to `0` — see the [CHANGELOG](CHANGELOG.md).
 
 | Code | Meaning |
 |------|---------|
-| `0` | Definitions confirmed current and real-time protection is on. |
-| `1001` | Defender not present, not the active AV (passive mode), the service couldn't be started, or the script isn't running elevated. |
+| `0` | Definitions confirmed current and real-time protection is on, **or** Defender is passive behind a third-party AV and there's nothing to remediate. The `Running mode` log line tells the two apart. |
+| `1001` | Defender not present, the service couldn't be started, or the script isn't running elevated. |
 | `1002` | New definitions applied but they're still older than `-MaxAgeDays`. |
 | `1003` | Every update method failed or timed out — check internet access, proxy config, and WSUS approval of definition updates. |
 | `1004` | Definitions are current, but real-time protection is off. |

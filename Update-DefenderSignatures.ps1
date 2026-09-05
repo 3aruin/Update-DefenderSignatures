@@ -68,9 +68,11 @@
 
 .NOTES
     Exit codes (non-zero marks the task as failed in N-sight):
-      0    - definitions confirmed current and real-time protection is on
-      1001 - Defender not present, not the active AV (passive mode), the service
-             could not be started, or the script is not running elevated
+      0    - definitions confirmed current and real-time protection is on, or
+             Defender is passive behind a third-party AV and there is nothing
+             for this script to remediate
+      1001 - Defender not present, the service could not be started, or the
+             script is not running elevated
       1002 - new definitions applied but they are still older than -MaxAgeDays
       1003 - every update method failed or timed out - check internet access,
              proxy configuration, and WSUS approval of definition updates
@@ -83,7 +85,7 @@
       1008 - an update method reported success but the signature version never
              moved - the update source is not offering current definitions
 
-    Version 1.1.0. See CHANGELOG.md for what changed and ARCHITECTURE.md for the
+    Version 1.2.0. See CHANGELOG.md for what changed and ARCHITECTURE.md for the
     control flow diagram and the full exit code contract.
 #>
 
@@ -108,6 +110,15 @@ $ErrorActionPreference = 'Stop'
 # named key; there are no numeric exit literals anywhere else in this file.
 $ExitCodes = @{
     Success               = 0
+
+    # Deliberately 0, and deliberately a separate key. A device where a
+    # third-party AV owns Defender is healthy, so failing the task on it
+    # raises a ticket nobody can action: the device is working as designed
+    # and no change to it would ever clear the alert. The key exists so the
+    # exit site still reads as its own outcome rather than as "success",
+    # and so this decision is visible here rather than buried in the branch.
+    NotActiveAntivirus    = 0
+
     DefenderUnavailable   = 1001
     StillStale            = 1002
     AllUpdatesFailed      = 1003
@@ -414,7 +425,7 @@ try {
     # [TimeZoneInfo]::Local rather than Get-TimeZone: command discovery failures
     # are terminating regardless of -ErrorAction, so a missing cmdlet here would
     # have produced 1005 before the script had logged anything at all.
-    Write-Log "Update-DefenderSignatures 1.1.0 starting."
+    Write-Log "Update-DefenderSignatures 1.2.0 starting."
     Write-Log ("Parameters               : MaxAgeDays={0}, WaitSeconds={1}, UpdateTimeoutSeconds={2}, Harden={3}" -f $MaxAgeDays, $WaitSeconds, $UpdateTimeoutSeconds, [bool]$Harden)
     Write-Log ("Local time zone          : {0}" -f [System.TimeZoneInfo]::Local.Id)
 
@@ -463,8 +474,9 @@ try {
         Write-Log ("Running mode             : {0}" -f $runningMode)
         if ($runningMode -ne 'Normal') {
             Write-Log ("Defender is not the active antivirus on this device (running mode '{0}')." -f $runningMode)
-            Write-Log "This is a healthy machine owned by another AV product. Exclude it from the Antivirus Update Check rather than treating this as a device fault."
-            exit $ExitCodes.DefenderUnavailable
+            Write-Log "This is a healthy machine owned by another AV product. Defender's own definitions and real-time protection are expected to look stale and off here, so there is nothing to remediate and nothing to raise."
+            Write-Log "Exiting 0 so the task does not fail. Point the Antivirus Update Check at the third-party product, or exclude this device from it, to stop the check firing in the first place."
+            exit $ExitCodes.NotActiveAntivirus
         }
     }
 

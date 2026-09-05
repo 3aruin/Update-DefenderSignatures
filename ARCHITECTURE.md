@@ -27,7 +27,9 @@ same hour.
 - The failure mode that scales badly is a wrong exit code, not a wrong action:
   a false non-zero on hundreds of devices is a ticket storm. Finding 4 in the
   1.0.0 audit was exactly this — passive-mode Defender reported `1004` on every
-  device running a third-party AV.
+  device running a third-party AV. 1.1.0 detected the case and reported `1001`
+  for it, which named the cause but kept the storm; 1.2.0 exits `0` there and
+  leaves the explanation in the log.
 - Each run can trigger a definition download. On an estate behind a single
   WSUS or a metered link, a synchronised Monday morning means a synchronised
   burst of definition traffic. The script does not stagger itself; if that
@@ -64,7 +66,7 @@ flowchart TD
     ELEV -- "yes" --> STATUS{"Get-MpComputerStatus succeeds?"}
     STATUS -- "no" --> X1001B(["1001 Defender unavailable"])
     STATUS -- "yes" --> MODE{"AMRunningMode Normal or absent?"}
-    MODE -- "no" --> X1001C(["1001 not the active AV"])
+    MODE -- "no" --> X0P(["0 passive, another AV owns the device"])
     MODE -- "yes" --> SVC{"AMServiceEnabled?"}
     SVC -- "no" --> STARTSVC["Start WinDefend, poll to 30s"]
     STARTSVC --> SVC2{"Running and AM service enabled?"}
@@ -103,12 +105,14 @@ In prose:
 lies about its cause. Then `Get-MpComputerStatus`, which fails outright if the
 Defender module or WMI provider is not there. Then `AMRunningMode`, which is
 the only reliable way to tell "Defender is the AV and it is behind" from
-"Defender is dormant because another product owns this device". The property
-does not exist before platform 4.18.2011, and its absence is logged and treated
-as inconclusive rather than as passive — refusing to run on old platforms would
-be worse than the false positive it prevents. If the AM service is off, the
-script starts `WinDefend` and polls for `Running`, then re-reads status rather
-than assuming the start took.
+"Defender is dormant because another product owns this device". The second case
+exits `0`: the device is healthy, nothing on it can be remediated, and a
+non-zero code there raises a ticket that no change to the device could ever
+clear. The property does not exist before platform 4.18.2011, and its absence
+is logged and treated as inconclusive rather than as passive — refusing to run
+on old platforms would be worse than the false positive it prevents. If the AM
+service is off, the script starts `WinDefend` and polls for `Running`, then
+re-reads status rather than assuming the start took.
 
 **Harden.** Optional, and the only thing the script writes. `Set-MpPreference`
 is applied and then read back with `Get-MpPreference`, because policy-managed
@@ -123,13 +127,16 @@ signature-version movement are then evaluated together to pick the exit code.
 
 ## Exit code contract
 
-Codes `0` and `1001`–`1005` keep the meanings they had in 1.0.0. `1006`–`1008`
-are new in 1.1.0 and split cases that used to be reported as `1002` or `1004`.
+Codes `1001`–`1005` keep the meanings they had in 1.0.0. `1006`–`1008` were
+added in 1.1.0 and split cases that used to be reported as `1002` or `1004`.
+`0` widened in 1.2.0: passive-mode Defender moved from `1001` to `0`, because
+the device is healthy and the code is read by an alerting system, not by a
+person. See the CHANGELOG for the reasoning.
 
 | Code | Meaning | Likely cause | First diagnostic step | Auto-recoverable |
 |------|---------|--------------|-----------------------|------------------|
-| `0` | Definitions current, real-time protection on. | Device was simply behind; the update landed. | None. Confirm the next AV Update Check passes. | Yes — already recovered |
-| `1001` | Defender not present, not the active AV, service unavailable, or the script is not elevated. | Third-party AV in passive/SxS mode; Defender disabled by policy; Tamper Protection blocking service start; task not configured to run as SYSTEM. | Read the log's `Running mode` line, then the elevation line. If mode is not `Normal`, this is a monitoring config problem, not a device problem. | No — needs a config change |
+| `0` | Definitions current with real-time protection on, **or** Defender is passive behind a third-party AV. | Device was simply behind and the update landed; or another AV product owns the device and Defender is dormant by design. | None for the device. Read the log's `Running mode` line to tell the two apart. If it is not `Normal`, fix the monitoring scope — this device should not be running an AV check that reads Defender. | Yes — nothing to recover |
+| `1001` | Defender not present, service unavailable, or the script is not elevated. | Defender disabled by policy; Tamper Protection blocking service start; task not configured to run as SYSTEM. | Read the log's elevation line, then the service-start lines. | No — needs a config change |
 | `1002` | New definitions applied but still older than `-MaxAgeDays`. | Update source only offers older definitions; endpoint clock skew; `-MaxAgeDays 0` on a device that just updated to yesterday's build. | Compare the before/after version lines, then check the device clock and the source's own definition age. | Sometimes — a later run may pass |
 | `1003` | Every update method failed or timed out. | No egress, proxy requiring authentication SYSTEM cannot supply, WSUS not approving definition updates. | `netsh winhttp show proxy` on the device, then check WSUS approvals for Definition Updates. | No |
 | `1004` | Definitions current, real-time protection off. | RTP disabled by policy, by a user with rights, or left off after troubleshooting. | `Get-MpPreference \| Select-Object DisableRealtimeMonitoring` and check for a managing policy. | No |
@@ -305,8 +312,20 @@ to disable it: that is by design impossible from script, and rightly so.
 `AMServiceEnabled` is `$true`, `RealTimeProtectionEnabled` is correctly
 `$false`. Reading only those two properties produces a confident `1004` on a
 perfectly healthy machine. `AMRunningMode` is checked before anything else
-touches Defender, and anything other than `Normal` exits `1001` with a log line
+touches Defender, and anything other than `Normal` exits `0` with a log line
 that points at the monitoring configuration rather than the device.
+
+The exit code moved from `1001` to `0` in 1.2.0. 1.1.0 detected the condition
+correctly and then still failed the task on it, which left the estate with the
+same ticket storm the detection existed to prevent — just with a better log
+line inside it. A passive device has nothing to remediate: Defender's
+definitions and real-time protection are supposed to look stale and off there,
+no rerun will change that, and no engineer touching the device can clear the
+alert. The honest signal is "this check does not apply here", and in an RMM
+that is `0` plus a log line, not a failure code. The device still needs
+excluding from the Antivirus Update Check or pointing at the AV that actually
+owns it; the log says so on every run, where it can be found by searching task
+output rather than by working a queue of false alerts.
 
 **Defender disabled by policy.** Either `Get-MpComputerStatus` fails, or the
 service refuses to start and stays disabled. Both paths exit `1001` within the
@@ -388,7 +407,7 @@ On a lab VM with a snapshot to roll back to:
 |------|-------------------|
 | `0` | Set the clock back a few days, or run with `-MaxAgeDays 30` on any healthy device. |
 | `1001` not elevated | Run from a non-elevated PowerShell session as a standard user. |
-| `1001` passive AV | Install any third-party AV that registers with Security Center; confirm with `(Get-MpComputerStatus).AMRunningMode`. |
+| `0` passive AV | Install any third-party AV that registers with Security Center; confirm with `(Get-MpComputerStatus).AMRunningMode`. Expect exit `0` and a `Running mode` line that is not `Normal`. |
 | `1001` service down | With Tamper Protection **off**: `sc.exe config WinDefend start= disabled`, then `sc.exe stop WinDefend`, then reboot. |
 | `1002` | Run with `-MaxAgeDays 0` on a device whose definitions are a day old and whose source has nothing newer. |
 | `1003` | Add an outbound firewall rule blocking `MpCmdRun.exe` and `svchost`, or point the device at a nonexistent WSUS via the `WUServer` policy. |
