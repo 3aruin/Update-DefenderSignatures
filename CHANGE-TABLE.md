@@ -1,6 +1,7 @@
 # Change table — audit findings to fixes
 
-Line numbers refer to the shipped `Update-DefenderSignatures.ps1` (561 lines).
+Line numbers refer to `Update-DefenderSignatures.ps1` as shipped in 1.1.0, the
+release this audit produced. Later versions have shifted them.
 
 ## P1 — production-breaking
 
@@ -9,7 +10,7 @@ Line numbers refer to the shipped `Update-DefenderSignatures.ps1` (561 lines).
 | 1 | `Write-Log` rejects empty strings | `$Message` now carries `[AllowNull()]` and `[AllowEmptyString()]`, with a `$null` guard in the body. Blank `MpCmdRun.exe` lines log as blank lines instead of throwing a binding exception into the outer catch. | `Update-DefenderSignatures.ps1:109-126` |
 | 2 | `2>&1` under `$ErrorActionPreference = 'Stop'` | The native call moved into a job scriptblock that sets `$ErrorActionPreference = 'Continue'` for itself only. The script-level preference is never modified, and the parent process never sees the redirected stream. | `Update-DefenderSignatures.ps1:441-460` (preference at `:445`) |
 | 3 | `$LASTEXITCODE` not reset | `Remove-Variable -Name LASTEXITCODE -Scope Global` immediately before the call; afterwards `Test-Path Variable:\LASTEXITCODE` decides whether a code was actually produced, and its absence is treated as failure. Deliberately *not* `$LASTEXITCODE = 0`, which would create a script-scope shadow that the engine never updates. | `Update-DefenderSignatures.ps1:447-457`, consumed at `:466-482` |
-| 4 | Passive-mode Defender undetectable | `AMRunningMode` read via `PSObject.Properties` so an absent property is distinguishable from a passive one. Anything other than `Normal` exits `1001` before any update is attempted; absence is logged as inconclusive and allowed to continue. | `Update-DefenderSignatures.ps1:324-347` |
+| 4 | Passive-mode Defender undetectable | `AMRunningMode` read via `PSObject.Properties` so an absent property is distinguishable from a passive one. Anything other than `Normal` ends the run before any update is attempted; absence is logged as inconclusive and allowed to continue. **Superseded in 1.2.0:** this exited `1001` as shipped in 1.1.0, which detected the healthy machine and then failed the task on it anyway; it now exits `0`. | `Update-DefenderSignatures.ps1:324-347` |
 | 5 | No elevation check | `Test-IsElevated` (WindowsPrincipal / BUILTIN\Administrators, which SYSTEM's token satisfies) runs as the first pre-flight step and exits `1001` naming the N-sight task configuration as the likely cause. | `Update-DefenderSignatures.ps1:127-134`, called at `:300-307` |
 
 ## P2 — reliability and logic
@@ -118,10 +119,12 @@ worth a line in a PR checklist.
 
 ## Better handled outside this script
 
-- **Passive-mode devices should not be running this check at all.** Exiting
-  `1001` is the correct behaviour, but the real fix is an N-sight exclusion or
-  a check that targets the installed AV product. Every `1001`-passive result is
-  a monitoring configuration defect, not a device defect.
+- **Passive-mode devices should not be running this check at all.** Since 1.2.0
+  the script exits `0` there, so the false alert is gone, but the underlying
+  fix is still an N-sight exclusion or a check that targets the installed AV
+  product. Every passive result is a monitoring configuration defect, not a
+  device defect — it is now recorded in the task output rather than in a
+  ticket queue.
 - **Proxy authentication for SYSTEM** belongs in WinHTTP machine-account
   configuration, not in the script.
 - **Execution policy** belongs in the Automation Manager object or a
